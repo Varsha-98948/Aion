@@ -1,4 +1,4 @@
-"""Developer-focused Streamlit dashboard for Aion's preprocessing pipeline.
+"""Developer-focused Streamlit dashboard for Aion's semantic preprocessing flow.
 
 The UI stays intentionally thin. Its job is to collect input, call the backend
 pipeline, and visualize results for debugging. Keeping Streamlit separate from
@@ -12,24 +12,27 @@ from pathlib import Path
 
 import streamlit as st
 
+from core.chunker import Chunker
+from core.embedder import EmbeddingEngine
 from core.pipeline import ProcessingPipeline, ProcessingResult
 
 UPLOADS_DIRECTORY = Path("data/uploads")
 
 
 def render_app() -> None:
-    """Render Aion's preprocessing dashboard."""
+    """Render Aion's preprocessing and embedding dashboard."""
 
     st.set_page_config(page_title="Aion", layout="wide")
     st.title("Aion")
-    st.subheader("Local-First AI Preprocessing Dashboard")
+    st.subheader("Local-First Semantic Memory Dashboard")
     st.write(
-        "This dashboard covers the final preprocessing stage before embeddings: "
-        "document loading, chunk generation, chunk serialization, and "
-        "developer-focused inspection."
+        "This dashboard shows Aion's semantic preprocessing layer: document "
+        "loading, chunk generation, embedding generation, and developer-focused "
+        "vector observability before retrieval and FAISS indexing."
     )
 
-    pipeline = ProcessingPipeline()
+    default_chunker = Chunker()
+    default_embedder = EmbeddingEngine()
 
     with st.sidebar:
         st.header("Chunker Config")
@@ -37,22 +40,47 @@ def render_app() -> None:
             "Chunk Size",
             min_value=100,
             max_value=4000,
-            value=pipeline.chunker.chunk_size,
+            value=default_chunker.chunk_size,
             step=50,
-            help="Character target for each chunk. This influences retrieval precision and context size later.",
+            help="Character target for each chunk. This influences context size and later retrieval precision.",
         )
         overlap = st.number_input(
             "Overlap",
             min_value=0,
             max_value=max(int(chunk_size) - 1, 0),
-            value=min(pipeline.chunker.overlap, max(int(chunk_size) - 1, 0)),
+            value=min(default_chunker.overlap, max(int(chunk_size) - 1, 0)),
             step=10,
-            help="Shared context between neighboring chunks to reduce boundary loss.",
+            help="Shared context between neighboring chunks to reduce boundary information loss.",
         )
 
-    pipeline.chunker.chunk_size = int(chunk_size)
-    pipeline.chunker.overlap = int(overlap)
-    pipeline.chunker.min_chunk_size = max(1, pipeline.chunker.chunk_size // 2)
+        st.header("Embedding Config")
+        embedding_model = st.text_input(
+            "Embedding Model",
+            value=default_embedder.model_name,
+            help="SentenceTransformer model used to convert chunks into semantic vectors.",
+        )
+        batch_size = st.number_input(
+            "Embedding Batch Size",
+            min_value=1,
+            max_value=256,
+            value=default_embedder.batch_size,
+            step=1,
+            help="How many chunks to embed at once. Larger batches can be faster but use more memory.",
+        )
+        normalize_embeddings = st.checkbox(
+            "Normalize Embeddings",
+            value=default_embedder.normalize_embeddings,
+            help="Normalized vectors often make cosine similarity behavior more stable for semantic retrieval.",
+        )
+
+    pipeline = ProcessingPipeline(
+        chunker=Chunker(chunk_size=int(chunk_size), overlap=int(overlap)),
+        embedder=EmbeddingEngine(
+            model_name=embedding_model.strip() or EmbeddingEngine.DEFAULT_MODEL_NAME,
+            batch_size=int(batch_size),
+            normalize_embeddings=normalize_embeddings,
+        ),
+    )
 
     uploaded_file = st.file_uploader(
         "Upload a document",
@@ -61,15 +89,21 @@ def render_app() -> None:
     )
 
     if uploaded_file is None:
-        st.info("Upload a PDF, TXT, or Markdown file to inspect the chunking pipeline.")
+        st.info("Upload a PDF, TXT, or Markdown file to inspect chunks and embeddings.")
         return
 
     saved_file_path = _save_uploaded_file(uploaded_file.name, bytes(uploaded_file.getbuffer()))
-    result = pipeline.process_file(saved_file_path, filename=uploaded_file.name, save_output=True)
+
+    try:
+        result = pipeline.process_file(saved_file_path, filename=uploaded_file.name, save_output=True)
+    except Exception as error:
+        st.error(f"Pipeline execution failed: {error}")
+        return
 
     _render_document_info(result)
     _render_chunk_stats(result)
-    _render_chunk_previews(result)
+    _render_embedding_stats(result)
+    _render_embedded_chunk_previews(result)
 
 
 def _save_uploaded_file(filename: str, file_bytes: bytes) -> Path:
@@ -99,6 +133,7 @@ def _render_document_info(result: ProcessingResult) -> None:
     with right_column:
         st.write(f"**Character Count:** `{len(result.document.content)}`")
         st.write(f"**Serialized Chunks:** `{result.chunk_file_path}`")
+        st.write(f"**Serialized Vectors:** `{result.vector_file_path}`")
         st.write("**Document Metadata:**")
         st.json(result.document.metadata)
 
@@ -115,8 +150,8 @@ def _render_chunk_stats(result: ProcessingResult) -> None:
     fourth_metric.metric("Largest Chunk", result.stats.largest_chunk_size)
 
     st.caption(
-        "Chunk statistics matter because chunk size distribution directly affects "
-        "how useful later embeddings and retrieval will be."
+        "Chunk statistics matter because chunk size distribution affects later "
+        "embedding quality and semantic retrieval precision."
     )
     st.write(
         f"Configured chunk size: `{result.stats.chunk_size}` characters | "
@@ -124,25 +159,59 @@ def _render_chunk_stats(result: ProcessingResult) -> None:
     )
 
 
-def _render_chunk_previews(result: ProcessingResult) -> None:
-    """Display chunk previews and chunk-level metadata for inspection."""
+def _render_embedding_stats(result: ProcessingResult) -> None:
+    """Display debugging metrics for generated embeddings."""
 
-    st.header("Chunk Previews")
+    st.header("Embedding Statistics")
+    first_metric, second_metric, third_metric, fourth_metric = st.columns(4)
 
-    if not result.chunks:
-        st.warning("No chunks were generated for this document.")
+    first_metric.metric("Embeddings Generated", result.embedding_stats.total_embeddings)
+    second_metric.metric("Embedding Dimension", result.embedding_stats.embedding_dimension)
+    third_metric.metric("Average Vector Norm", f"{result.embedding_stats.average_vector_norm:.4f}")
+    fourth_metric.metric("Largest Vector Norm", f"{result.embedding_stats.largest_vector_norm:.4f}")
+
+    st.write(f"**Embedding Model:** `{result.embedding_stats.model_name}`")
+    st.write(
+        f"**Batch Size:** `{result.embedding_stats.batch_size}` | "
+        f"**Normalized:** `{result.embedding_stats.normalized_embeddings}` | "
+        f"**Smallest Vector Norm:** `{result.embedding_stats.smallest_vector_norm:.4f}`"
+    )
+    st.caption(
+        "Embeddings turn meaning into vectors. Keyword search looks for exact "
+        "terms, while vector search looks for nearby meanings in embedding space."
+    )
+
+
+def _render_embedded_chunk_previews(result: ProcessingResult) -> None:
+    """Display chunk text plus embedding previews for inspection."""
+
+    st.header("Chunk and Embedding Previews")
+
+    if not result.embedded_chunks:
+        st.warning("No embeddings were generated for this document.")
         return
 
-    for chunk in result.chunks:
+    for embedded_chunk in result.embedded_chunks:
+        embedding_preview = _format_embedding_preview(embedded_chunk.embedding)
         preview_title = (
-            f"Chunk {chunk.chunk_index} | "
-            f"{len(chunk.text)} chars | "
-            f"{len(chunk.text.split())} words"
+            f"Chunk {embedded_chunk.metadata.get('chunk_index', '?')} | "
+            f"{len(embedded_chunk.text)} chars | "
+            f"{len(embedded_chunk.embedding)} dims"
         )
-        with st.expander(preview_title, expanded=chunk.chunk_index == 0):
-            st.write(chunk.text)
-            st.write("**Chunk Metadata:**")
-            st.json(chunk.metadata)
+        with st.expander(preview_title, expanded=embedded_chunk.metadata.get("chunk_index") == 0):
+            st.write(embedded_chunk.text)
+            st.write("**Embedding Preview:**")
+            st.code(embedding_preview, language="text")
+            st.write("**Embedding Metadata:**")
+            st.json(embedded_chunk.metadata)
+
+
+def _format_embedding_preview(embedding: list[float], limit: int = 8) -> str:
+    """Return a short readable preview of an embedding vector."""
+
+    preview_values = ", ".join(f"{value:.4f}" for value in embedding[:limit])
+    suffix = ", ..." if len(embedding) > limit else ""
+    return f"[{preview_values}{suffix}]"
 
 
 def main() -> None:
