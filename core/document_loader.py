@@ -8,10 +8,10 @@ extraction while this loader handles orchestration and normalization.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Callable
 
-from .pdf_parser import extract_pdf_text
 from .schema import Document
 from .text_parser import extract_text_file
 
@@ -34,10 +34,10 @@ class DocumentLoader:
         # future formats such as DOCX or HTML without mixing that logic into
         # the parser implementations themselves.
         self._parsers: dict[str, ParserFunction] = {
-            "pdf": extract_pdf_text,
             "txt": extract_text_file,
             "md": extract_text_file,
         }
+        self._register_pdf_parser()
 
     def load(self, file_path: str, filename: str | None = None) -> Document:
         """Load a file and return a normalized ``Document`` object."""
@@ -46,11 +46,18 @@ class DocumentLoader:
         file_type = path.suffix.lower().lstrip(".")
         parser = self._get_parser(file_type)
         parsed_document = parser(str(path))
+        resolved_filename = filename or path.name
+        content = self._extract_content(parsed_document)
 
         return Document(
-            filename=filename or path.name,
+            doc_id=self._build_document_id(
+                filename=resolved_filename,
+                file_type=file_type,
+                content=content,
+            ),
+            filename=resolved_filename,
             file_type=file_type,
-            content=self._extract_content(parsed_document),
+            content=content,
             metadata=self._extract_metadata(parsed_document),
         )
 
@@ -85,3 +92,39 @@ class DocumentLoader:
             raise TypeError("Parser output 'metadata' must be a dictionary.")
 
         return metadata
+
+    @staticmethod
+    def _build_document_id(filename: str, file_type: str, content: str) -> str:
+        """Build a deterministic document ID from stable source properties.
+
+        Stable IDs help later preprocessing stages persist chunks, embeddings,
+        and retrieval references in a repeatable way across runs.
+        """
+
+        digest_input = f"{filename}:{file_type}:{content}".encode("utf-8")
+        return hashlib.sha1(digest_input).hexdigest()
+
+    def _register_pdf_parser(self) -> None:
+        """Register the PDF parser without blocking text-only workflows.
+
+        Modular pipelines should degrade gracefully. If the PDF dependency is
+        missing, text and markdown ingestion can still run while PDF requests
+        receive a focused error only when that parser is actually needed.
+        """
+
+        try:
+            from .pdf_parser import extract_pdf_text
+        except ModuleNotFoundError:
+            self._parsers["pdf"] = self._missing_pdf_dependency_parser
+            return
+
+        self._parsers["pdf"] = extract_pdf_text
+
+    @staticmethod
+    def _missing_pdf_dependency_parser(_: str) -> ParserResult:
+        """Raise a helpful error when PDF support is unavailable."""
+
+        raise ModuleNotFoundError(
+            "PDF parsing requires the PyMuPDF dependency. Install project "
+            "requirements before processing PDF files."
+        )
