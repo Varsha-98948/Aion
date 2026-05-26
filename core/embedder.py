@@ -115,6 +115,25 @@ class EmbeddingEngine:
 
         return embedded_chunks
 
+    def embed_texts(self, texts: list[str], batch_size: int | None = None) -> list[list[float]]:
+        """Generate embeddings for plain text inputs such as search queries.
+
+        Query embeddings must come from the same model as chunk embeddings so
+        both live in the same semantic vector space. That shared space is what
+        lets FAISS compare a natural-language question against stored chunks.
+        """
+
+        cleaned_texts = [text.strip() for text in texts if text.strip()]
+        if not cleaned_texts:
+            return []
+
+        embedding_matrix = self._encode_texts(
+            texts=cleaned_texts,
+            batch_size=batch_size or self.batch_size,
+        )
+        validate_embedding_dimensions(embedding_matrix)
+        return [serialize_embedding(embedding_vector) for embedding_vector in embedding_matrix]
+
     def _prepare_batch(self, chunks: list[Chunk]) -> _EmbeddingBatch:
         """Create a stable batch representation from chunk objects."""
 

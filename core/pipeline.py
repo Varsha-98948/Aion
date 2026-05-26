@@ -60,6 +60,7 @@ from .document_loader import DocumentLoader
 from .embedder import EmbeddingEngine
 from .embedding_models import EmbeddedChunk
 from .schema import Document
+from .vector_store import VectorStore
 from .vector_utils import serialize_embedding, validate_embedding_dimensions, vector_norm
 
 
@@ -101,6 +102,22 @@ class EmbeddingStats:
 
 
 @dataclass(slots=True)
+class IndexStats:
+    """Debugging statistics for a persisted vector index.
+
+    Index stats help verify that the semantic retrieval layer is aligned with
+    the embedding layer. A FAISS index is only useful when its row count,
+    vector dimension, and metadata records stay consistent.
+    """
+
+    indexed_vectors: int
+    embedding_dimension: int
+    index_type: str
+    metric: str
+    index_directory: str
+
+
+@dataclass(slots=True)
 class ProcessingResult:
     """Structured result returned by the preprocessing pipeline."""
 
@@ -109,8 +126,11 @@ class ProcessingResult:
     embedded_chunks: list[EmbeddedChunk]
     stats: PipelineStats
     embedding_stats: EmbeddingStats
+    index_stats: IndexStats
     chunk_file_path: Path | None = None
     vector_file_path: Path | None = None
+    index_file_path: Path | None = None
+    index_metadata_file_path: Path | None = None
 
 
 class ProcessingPipeline:
@@ -127,16 +147,21 @@ class ProcessingPipeline:
         loader: DocumentLoader | None = None,
         chunker: Chunker | None = None,
         embedder: EmbeddingEngine | None = None,
+        vector_store: VectorStore | None = None,
         chunks_directory: str | Path = "data/chunks",
         vectors_directory: str | Path = "data/vectors",
+        indexes_directory: str | Path = "data/indexes",
     ) -> None:
         self.loader = loader or DocumentLoader()
         self.chunker = chunker or Chunker()
         self.embedder = embedder or EmbeddingEngine()
+        self.vector_store = vector_store or VectorStore(index_directory=indexes_directory)
         self.chunks_directory = Path(chunks_directory)
         self.vectors_directory = Path(vectors_directory)
+        self.indexes_directory = Path(indexes_directory)
         self.chunks_directory.mkdir(parents=True, exist_ok=True)
         self.vectors_directory.mkdir(parents=True, exist_ok=True)
+        self.indexes_directory.mkdir(parents=True, exist_ok=True)
 
     def process_file(
         self,
@@ -144,6 +169,7 @@ class ProcessingPipeline:
         filename: str | None = None,
         save_output: bool = True,
         generate_embeddings: bool = True,
+        build_index: bool = True,
     ) -> ProcessingResult:
         """Run the document-to-vector flow for a single file."""
 
@@ -169,14 +195,27 @@ class ProcessingPipeline:
                 stats=embedding_stats,
             )
 
+        index_file_path: Path | None = None
+        index_metadata_file_path: Path | None = None
+        if embedded_chunks and build_index:
+            self.vector_store.build_index(embedded_chunks)
+            if save_output:
+                index_directory = self._build_index_directory(document)
+                index_file_path, index_metadata_file_path = self.vector_store.save_index(index_directory)
+
+        index_stats = self.get_index_stats()
+
         return ProcessingResult(
             document=document,
             chunks=chunks,
             embedded_chunks=embedded_chunks,
             stats=stats,
             embedding_stats=embedding_stats,
+            index_stats=index_stats,
             chunk_file_path=chunk_file_path,
             vector_file_path=vector_file_path,
+            index_file_path=index_file_path,
+            index_metadata_file_path=index_metadata_file_path,
         )
 
     def save_chunks(
@@ -292,6 +331,17 @@ class ProcessingPipeline:
             normalized_embeddings=self.embedder.normalize_embeddings,
         )
 
+    def get_index_stats(self) -> IndexStats:
+        """Return FAISS index metrics useful for retrieval debugging."""
+
+        return IndexStats(
+            indexed_vectors=self.vector_store.record_count,
+            embedding_dimension=self.vector_store.embedding_dimension,
+            index_type="IndexFlatIP",
+            metric="cosine_similarity_via_normalized_inner_product",
+            index_directory=str(self.vector_store.index_directory),
+        )
+
     @staticmethod
     def _serialize_document(document: Document) -> dict[str, Any]:
         """Convert a document object into a JSON-friendly dictionary."""
@@ -340,6 +390,12 @@ class ProcessingPipeline:
         safe_stem = self._slugify_filename(Path(document.filename).stem)
         return f"{safe_stem}_{document.doc_id[:12]}_vectors.json"
 
+    def _build_index_directory(self, document: Document) -> Path:
+        """Build a deterministic folder for persisted FAISS index artifacts."""
+
+        safe_stem = self._slugify_filename(Path(document.filename).stem)
+        return self.indexes_directory / f"{safe_stem}_{document.doc_id[:12]}"
+
     @staticmethod
     def _slugify_filename(filename_stem: str) -> str:
         """Convert a filename into a filesystem-friendly stem."""
@@ -349,4 +405,10 @@ class ProcessingPipeline:
         return slug or "document"
 
 
-__all__ = ["EmbeddingStats", "PipelineStats", "ProcessingPipeline", "ProcessingResult"]
+__all__ = [
+    "EmbeddingStats",
+    "IndexStats",
+    "PipelineStats",
+    "ProcessingPipeline",
+    "ProcessingResult",
+]

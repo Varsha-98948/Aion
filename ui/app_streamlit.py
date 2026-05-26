@@ -15,6 +15,8 @@ import streamlit as st
 from core.chunker import Chunker
 from core.embedder import EmbeddingEngine
 from core.pipeline import ProcessingPipeline, ProcessingResult
+from core.retriever import Retriever
+from core.retrieval_models import RetrievalResult
 
 UPLOADS_DIRECTORY = Path("data/uploads")
 
@@ -72,6 +74,14 @@ def render_app() -> None:
             value=default_embedder.normalize_embeddings,
             help="Normalized vectors often make cosine similarity behavior more stable for semantic retrieval.",
         )
+        top_k = st.number_input(
+            "Retrieval Top K",
+            min_value=1,
+            max_value=20,
+            value=5,
+            step=1,
+            help="Number of nearest chunks to return for semantic search.",
+        )
 
     pipeline = ProcessingPipeline(
         chunker=Chunker(chunk_size=int(chunk_size), overlap=int(overlap)),
@@ -103,6 +113,8 @@ def render_app() -> None:
     _render_document_info(result)
     _render_chunk_stats(result)
     _render_embedding_stats(result)
+    _render_index_stats(result)
+    _render_semantic_search(result, pipeline=pipeline, top_k=int(top_k))
     _render_embedded_chunk_previews(result)
 
 
@@ -134,6 +146,7 @@ def _render_document_info(result: ProcessingResult) -> None:
         st.write(f"**Character Count:** `{len(result.document.content)}`")
         st.write(f"**Serialized Chunks:** `{result.chunk_file_path}`")
         st.write(f"**Serialized Vectors:** `{result.vector_file_path}`")
+        st.write(f"**FAISS Index:** `{result.index_file_path}`")
         st.write("**Document Metadata:**")
         st.json(result.document.metadata)
 
@@ -180,6 +193,73 @@ def _render_embedding_stats(result: ProcessingResult) -> None:
         "Embeddings turn meaning into vectors. Keyword search looks for exact "
         "terms, while vector search looks for nearby meanings in embedding space."
     )
+
+
+def _render_index_stats(result: ProcessingResult) -> None:
+    """Display FAISS index metrics for retrieval debugging."""
+
+    st.header("Vector Index Statistics")
+    first_metric, second_metric, third_metric = st.columns(3)
+
+    first_metric.metric("Indexed Vectors", result.index_stats.indexed_vectors)
+    second_metric.metric("Index Dimension", result.index_stats.embedding_dimension)
+    third_metric.metric("Index Type", result.index_stats.index_type)
+
+    st.write(f"**Metric:** `{result.index_stats.metric}`")
+    st.write(f"**Index Metadata:** `{result.index_metadata_file_path}`")
+    st.caption(
+        "FAISS searches nearest vectors. With normalized embeddings, inner "
+        "product behaves like cosine similarity for semantic retrieval."
+    )
+
+
+def _render_semantic_search(
+    result: ProcessingResult,
+    pipeline: ProcessingPipeline,
+    top_k: int,
+) -> None:
+    """Render semantic search controls and retrieval results."""
+
+    st.header("Semantic Search")
+    query = st.text_input("Search Query", placeholder="Ask for a concept from the uploaded document")
+
+    if not query.strip():
+        st.info("Enter a query to retrieve the nearest embedded chunks.")
+        return
+
+    if result.index_stats.indexed_vectors == 0:
+        st.warning("No vector index is available for this document.")
+        return
+
+    retriever = Retriever(
+        vector_store=pipeline.vector_store,
+        embedding_engine=pipeline.embedder,
+        top_k=top_k,
+    )
+
+    try:
+        retrieval_results = retriever.retrieve(query, top_k=top_k)
+    except Exception as error:
+        st.error(f"Retrieval failed: {error}")
+        return
+
+    _render_retrieval_results(retrieval_results)
+
+
+def _render_retrieval_results(results: list[RetrievalResult]) -> None:
+    """Display ranked retrieval results with similarity scores."""
+
+    if not results:
+        st.warning("No matching chunks were retrieved.")
+        return
+
+    for rank, result in enumerate(results, start=1):
+        title = f"Rank {rank} | Score {result.similarity_score:.4f}"
+        with st.expander(title, expanded=rank == 1):
+            st.progress(max(0.0, min(1.0, result.similarity_score)))
+            st.write(result.text)
+            st.write("**Source Metadata:**")
+            st.json(result.metadata)
 
 
 def _render_embedded_chunk_previews(result: ProcessingResult) -> None:
