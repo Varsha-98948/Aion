@@ -23,6 +23,7 @@ from core.retrieval_models import RetrievalResult
 from core.response_models import GeneratedResponse
 
 UPLOADS_DIRECTORY = Path("data/uploads")
+DEFAULT_OLLAMA_MODELS = ["gemma", "mistral", "llama3"]
 
 
 def render_app() -> None:
@@ -39,6 +40,9 @@ def render_app() -> None:
 
     default_chunker = Chunker()
     default_embedder = EmbeddingEngine()
+    ollama_discovery_client = OllamaClient(model="gemma")
+    installed_ollama_models = ollama_discovery_client.list_models()
+    ollama_model_options = _build_ollama_model_options(installed_ollama_models)
 
     with st.sidebar:
         st.header("Chunker Config")
@@ -87,11 +91,16 @@ def render_app() -> None:
             help="Number of nearest chunks to return for semantic search.",
         )
         st.header("Generation Config")
-        ollama_model = st.text_input(
+        ollama_model = st.selectbox(
             "Ollama Model",
-            value="mistral",
+            options=ollama_model_options,
+            index=_get_default_ollama_model_index(ollama_model_options),
             help="Local Ollama model used for grounded answer generation.",
         )
+        if installed_ollama_models:
+            st.caption(f"Installed models detected: {', '.join(installed_ollama_models)}")
+        else:
+            st.caption("No installed Ollama models detected. Choose a model, then install it if needed.")
         temperature = st.slider(
             "Temperature",
             min_value=0.0,
@@ -135,17 +144,18 @@ def render_app() -> None:
 
     _render_document_info(result)
     _render_chunk_stats(result)
+    _render_embedded_chunk_previews(result)
     _render_embedding_stats(result)
     _render_index_stats(result)
-    _render_rag_search(
+    _render_ask_aion(
         result,
         pipeline=pipeline,
         top_k=int(top_k),
-        ollama_model=ollama_model.strip() or "mistral",
+        ollama_model=ollama_model,
+        installed_ollama_models=installed_ollama_models,
         temperature=float(temperature),
         show_prompt_debug=show_prompt_debug,
     )
-    _render_embedded_chunk_previews(result)
 
 
 def _save_uploaded_file(filename: str, file_bytes: bytes) -> Path:
@@ -158,6 +168,47 @@ def _save_uploaded_file(filename: str, file_bytes: bytes) -> Path:
         file.write(file_bytes)
 
     return output_path
+
+
+def _build_ollama_model_options(installed_models: list[str]) -> list[str]:
+    """Return dropdown options with discovered local models first."""
+
+    options: list[str] = []
+    for model_name in [*installed_models, *DEFAULT_OLLAMA_MODELS]:
+        if model_name not in options:
+            options.append(model_name)
+
+    return options
+
+
+def _get_default_ollama_model_index(model_options: list[str]) -> int:
+    """Prefer gemma as the default visible model when available."""
+
+    if "gemma" in model_options:
+        return model_options.index("gemma")
+
+    for option_index, model_name in enumerate(model_options):
+        if _normalize_ollama_model_name(model_name) == "gemma":
+            return option_index
+
+    return 0
+
+
+def _normalize_ollama_model_name(model_name: str) -> str:
+    """Normalize Ollama tags so gemma and gemma:latest compare cleanly."""
+
+    return model_name.split(":", maxsplit=1)[0].strip().lower()
+
+
+def _is_ollama_model_installed(selected_model: str, installed_models: list[str]) -> bool:
+    """Return True when the selected model exists in local Ollama models."""
+
+    selected_model_normalized = _normalize_ollama_model_name(selected_model)
+    return any(
+        installed_model == selected_model
+        or _normalize_ollama_model_name(installed_model) == selected_model_normalized
+        for installed_model in installed_models
+    )
 
 
 def _render_document_info(result: ProcessingResult) -> None:
@@ -243,25 +294,45 @@ def _render_index_stats(result: ProcessingResult) -> None:
     )
 
 
-def _render_rag_search(
+def _render_ask_aion(
     result: ProcessingResult,
     pipeline: ProcessingPipeline,
     top_k: int,
     ollama_model: str,
+    installed_ollama_models: list[str],
     temperature: float,
     show_prompt_debug: bool,
 ) -> None:
-    """Render RAG query controls, retrieved context, and generated answers."""
+    """Render the visible user-facing RAG interaction flow."""
 
-    st.header("RAG Response Generation")
-    query = st.text_input("User Query", placeholder="Ask a question about the uploaded document")
+    st.header("Ask Aion")
+    st.caption("USER QUERY -> SEMANTIC RETRIEVAL -> CONTEXT INJECTION -> OLLAMA RESPONSE GENERATION")
+    query = st.text_area(
+        "User Query",
+        placeholder=(
+            "What does this document say about semantic search?\n"
+            "Summarize the memory architecture"
+        ),
+        height=120,
+    )
+    generate_response = st.button("Generate Response", type="primary")
+
+    if not generate_response:
+        return
 
     if not query.strip():
-        st.info("Enter a query to retrieve context and generate a grounded answer.")
+        st.warning("Enter a query before generating a response.")
         return
 
     if result.index_stats.indexed_vectors == 0:
         st.warning("No vector index is available for this document.")
+        return
+
+    if not _is_ollama_model_installed(ollama_model, installed_ollama_models):
+        st.error(
+            "Selected Ollama model is not installed locally.\n\n"
+            f"Run:\nollama pull {ollama_model}"
+        )
         return
 
     retriever = Retriever(
@@ -271,9 +342,10 @@ def _render_rag_search(
     )
 
     try:
+        prompt_builder = PromptBuilder()
         rag_pipeline = RAGPipeline(
             retriever=retriever,
-            prompt_builder=PromptBuilder(),
+            prompt_builder=prompt_builder,
             llm_client=OllamaClient(model=ollama_model, temperature=temperature),
             top_k=top_k,
         )
@@ -282,12 +354,17 @@ def _render_rag_search(
         st.error(f"RAG generation failed: {error}")
         return
 
-    _render_generated_response(generated_response, show_prompt_debug=show_prompt_debug)
+    _render_generated_response(
+        generated_response,
+        prompt_builder=prompt_builder,
+        show_prompt_debug=show_prompt_debug,
+    )
     _render_retrieval_results(generated_response.retrieved_chunks)
 
 
 def _render_generated_response(
     generated_response: GeneratedResponse,
+    prompt_builder: PromptBuilder,
     show_prompt_debug: bool,
 ) -> None:
     """Display the generated answer and optional prompt debugging details."""
@@ -300,23 +377,29 @@ def _render_generated_response(
     )
 
     if show_prompt_debug:
+        injected_context = prompt_builder.format_context(generated_response.retrieved_chunks)
         with st.expander("Prompt Debug", expanded=False):
+            st.write("**Injected Context:**")
+            st.code(injected_context, language="text")
             st.write("**System Prompt:**")
             st.code(str(generated_response.metadata.get("system_prompt", "")), language="text")
-            st.write("**User Prompt:**")
+            st.write("**Final Prompt:**")
             st.code(str(generated_response.metadata.get("prompt", "")), language="text")
 
 
 def _render_retrieval_results(results: list[RetrievalResult]) -> None:
     """Display ranked retrieval results with similarity scores."""
 
+    st.subheader("Retrieved Chunks")
+
     if not results:
         st.warning("No matching chunks were retrieved.")
         return
 
     for rank, result in enumerate(results, start=1):
-        title = f"Rank {rank} | Score {result.similarity_score:.4f}"
+        title = f"Rank {rank} | Similarity Score {result.similarity_score:.4f}"
         with st.expander(title, expanded=rank == 1):
+            st.write(f"**Similarity Score:** `{result.similarity_score:.4f}`")
             st.progress(max(0.0, min(1.0, result.similarity_score)))
             st.write(result.text)
             st.write("**Source Metadata:**")

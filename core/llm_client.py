@@ -56,6 +56,42 @@ class OllamaClient:
         except requests.RequestException:
             return False
 
+    def list_models(self) -> list[str]:
+        """Return locally installed Ollama model names.
+
+        Ollama stores models locally. Discovering installed models before
+        generation avoids sending requests to missing models and gives the UI a
+        friendlier way to guide users toward `ollama pull <model>`.
+        """
+
+        try:
+            response = requests.get(
+                f"{self.base_url}/api/tags",
+                timeout=min(self.config.timeout_seconds, 10),
+            )
+            response.raise_for_status()
+        except requests.RequestException:
+            return []
+
+        response_payload = response.json()
+        if not isinstance(response_payload, dict):
+            return []
+
+        models = response_payload.get("models", [])
+        if not isinstance(models, list):
+            return []
+
+        model_names: list[str] = []
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+
+            model_name = model.get("name") or model.get("model")
+            if isinstance(model_name, str) and model_name.strip():
+                model_names.append(model_name.strip())
+
+        return sorted(set(model_names))
+
     def generate(
         self,
         prompt: str,
