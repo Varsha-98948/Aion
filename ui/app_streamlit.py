@@ -14,9 +14,13 @@ import streamlit as st
 
 from core.chunker import Chunker
 from core.embedder import EmbeddingEngine
+from core.llm_client import OllamaClient
 from core.pipeline import ProcessingPipeline, ProcessingResult
+from core.prompt_builder import PromptBuilder
+from core.rag_pipeline import RAGPipeline
 from core.retriever import Retriever
 from core.retrieval_models import RetrievalResult
+from core.response_models import GeneratedResponse
 
 UPLOADS_DIRECTORY = Path("data/uploads")
 
@@ -82,6 +86,25 @@ def render_app() -> None:
             step=1,
             help="Number of nearest chunks to return for semantic search.",
         )
+        st.header("Generation Config")
+        ollama_model = st.text_input(
+            "Ollama Model",
+            value="mistral",
+            help="Local Ollama model used for grounded answer generation.",
+        )
+        temperature = st.slider(
+            "Temperature",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.2,
+            step=0.05,
+            help="Lower values make answers more deterministic.",
+        )
+        show_prompt_debug = st.checkbox(
+            "Show Prompt Debug",
+            value=False,
+            help="Display the final grounded prompt sent to Ollama.",
+        )
 
     pipeline = ProcessingPipeline(
         chunker=Chunker(chunk_size=int(chunk_size), overlap=int(overlap)),
@@ -114,7 +137,14 @@ def render_app() -> None:
     _render_chunk_stats(result)
     _render_embedding_stats(result)
     _render_index_stats(result)
-    _render_semantic_search(result, pipeline=pipeline, top_k=int(top_k))
+    _render_rag_search(
+        result,
+        pipeline=pipeline,
+        top_k=int(top_k),
+        ollama_model=ollama_model.strip() or "mistral",
+        temperature=float(temperature),
+        show_prompt_debug=show_prompt_debug,
+    )
     _render_embedded_chunk_previews(result)
 
 
@@ -213,18 +243,21 @@ def _render_index_stats(result: ProcessingResult) -> None:
     )
 
 
-def _render_semantic_search(
+def _render_rag_search(
     result: ProcessingResult,
     pipeline: ProcessingPipeline,
     top_k: int,
+    ollama_model: str,
+    temperature: float,
+    show_prompt_debug: bool,
 ) -> None:
-    """Render semantic search controls and retrieval results."""
+    """Render RAG query controls, retrieved context, and generated answers."""
 
-    st.header("Semantic Search")
-    query = st.text_input("Search Query", placeholder="Ask for a concept from the uploaded document")
+    st.header("RAG Response Generation")
+    query = st.text_input("User Query", placeholder="Ask a question about the uploaded document")
 
     if not query.strip():
-        st.info("Enter a query to retrieve the nearest embedded chunks.")
+        st.info("Enter a query to retrieve context and generate a grounded answer.")
         return
 
     if result.index_stats.indexed_vectors == 0:
@@ -238,12 +271,40 @@ def _render_semantic_search(
     )
 
     try:
-        retrieval_results = retriever.retrieve(query, top_k=top_k)
+        rag_pipeline = RAGPipeline(
+            retriever=retriever,
+            prompt_builder=PromptBuilder(),
+            llm_client=OllamaClient(model=ollama_model, temperature=temperature),
+            top_k=top_k,
+        )
+        generated_response = rag_pipeline.ask(query, top_k=top_k)
     except Exception as error:
-        st.error(f"Retrieval failed: {error}")
+        st.error(f"RAG generation failed: {error}")
         return
 
-    _render_retrieval_results(retrieval_results)
+    _render_generated_response(generated_response, show_prompt_debug=show_prompt_debug)
+    _render_retrieval_results(generated_response.retrieved_chunks)
+
+
+def _render_generated_response(
+    generated_response: GeneratedResponse,
+    show_prompt_debug: bool,
+) -> None:
+    """Display the generated answer and optional prompt debugging details."""
+
+    st.subheader("Generated Response")
+    st.write(generated_response.response)
+    st.caption(
+        f"Model: `{generated_response.metadata.get('llm_model')}` | "
+        f"Retrieved chunks: `{generated_response.metadata.get('retrieved_chunk_count')}`"
+    )
+
+    if show_prompt_debug:
+        with st.expander("Prompt Debug", expanded=False):
+            st.write("**System Prompt:**")
+            st.code(str(generated_response.metadata.get("system_prompt", "")), language="text")
+            st.write("**User Prompt:**")
+            st.code(str(generated_response.metadata.get("prompt", "")), language="text")
 
 
 def _render_retrieval_results(results: list[RetrievalResult]) -> None:
