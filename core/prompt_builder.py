@@ -5,10 +5,15 @@ instructions about how to use it. This reduces hallucinations because the LLM
 does not need to rely only on parametric memory, which is knowledge stored in
 model weights. Instead, it can answer from Aion's external memory: the retrieved
 chunks produced by the semantic search layer.
+
+Memory-aware prompting includes recent conversation history so the model can
+build on previous turns in the same session while remaining grounded in
+retrieved documents.
 """
 
 from __future__ import annotations
 
+from .memory_models import ConversationTurn
 from .retrieval_models import RetrievalResult
 
 
@@ -29,9 +34,19 @@ class PromptBuilder:
     )
 
     DEFAULT_USER_TEMPLATE = (
-        "Retrieved context:\n"
+        "Retrieved document context:\n"
         "{context}\n\n"
         "User question:\n"
+        "{query}\n\n"
+        "Answer:"
+    )
+
+    MEMORY_AWARE_USER_TEMPLATE = (
+        "Conversation history:\n"
+        "{memory}\n\n"
+        "Retrieved document context:\n"
+        "{context}\n\n"
+        "Current question:\n"
         "{query}\n\n"
         "Answer:"
     )
@@ -54,14 +69,7 @@ class PromptBuilder:
 
         return self.system_prompt.strip()
 
-    def build_prompt(self, query: str, retrieved_chunks: list[RetrievalResult]) -> str:
-        """Build the final user prompt with retrieved context injected."""
 
-        context = self.format_context(retrieved_chunks)
-        return self.user_template.format(
-            context=context,
-            query=query.strip(),
-        ).strip()
 
     def format_context(self, retrieved_chunks: list[RetrievalResult]) -> str:
         """Format retrieved chunks as visible, ranked prompt context.
@@ -98,5 +106,50 @@ class PromptBuilder:
 
         return "\n\n".join(formatted_blocks)
 
+    def format_memory_history(self, memory_turns: list[ConversationTurn]) -> str:
+        """Format recent conversation turns for prompt injection.
 
-__all__ = ["PromptBuilder"]
+        Conversation history is shown explicitly so the model knows what was
+        discussed previously in this session. The history is separate from
+        retrieved document context, so the model can distinguish between
+        what was said before and what the documents contain.
+        """
+
+        if not memory_turns:
+            return "[No previous conversation history]"
+
+        formatted_turns: list[str] = []
+        for turn in memory_turns:
+            turn_text = (
+                f"User: {turn.user_message}\n"
+                f"Assistant: {turn.assistant_message}"
+            )
+            formatted_turns.append(turn_text)
+
+        return "\n\n".join(formatted_turns)
+
+    def build_prompt(
+        self,
+        query: str,
+        retrieved_chunks: list[RetrievalResult],
+        memory_turns: list[ConversationTurn] | None = None,
+    ) -> str:
+        """Build the final user prompt with memory and retrieved context injected."""
+
+        context = self.format_context(retrieved_chunks)
+
+        if memory_turns:
+            memory = self.format_memory_history(memory_turns)
+            return self.MEMORY_AWARE_USER_TEMPLATE.format(
+                memory=memory,
+                context=context,
+                query=query.strip(),
+            ).strip()
+        else:
+            return self.user_template.format(
+                context=context,
+                query=query.strip(),
+            ).strip()
+
+
+__all__ = ["PromptBuilder", "ConversationTurn"]

@@ -356,14 +356,19 @@ def _render_ask_aion(
             retriever=retriever,
             prompt_builder=prompt_builder,
             llm_client=OllamaClient(model=ollama_model, temperature=temperature),
+            conversation_manager=conversation_manager,
             top_k=top_k,
+            memory_window=5,
         )
         generated_response = rag_pipeline.ask(query, top_k=top_k)
     except Exception as error:
         st.error(f"RAG generation failed: {error}")
         return
 
-    conversation_manager.add_turn(user_message=query, assistant_message=generated_response.response)
+    st.subheader("Response Metrics")
+    metric_col_1, metric_col_2 = st.columns(2)
+    metric_col_1.metric("Memory Turns Used", generated_response.metadata.get("memory_turn_count", 0))
+    metric_col_2.metric("Retrieved Chunks", generated_response.metadata.get("retrieved_chunk_count", 0))
 
     _render_generated_response(
         generated_response,
