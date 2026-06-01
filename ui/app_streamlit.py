@@ -13,6 +13,7 @@ from pathlib import Path
 import streamlit as st
 
 from core.chunker import Chunker
+from core.conversation_manager import ConversationManager
 from core.embedder import EmbeddingEngine
 from core.llm_client import OllamaClient
 from core.pipeline import ProcessingPipeline, ProcessingResult
@@ -124,6 +125,11 @@ def render_app() -> None:
         ),
     )
 
+    if "conversation_session_id" not in st.session_state:
+        st.session_state["conversation_session_id"] = "default"
+
+    conversation_manager = _get_conversation_manager(st.session_state["conversation_session_id"])
+
     uploaded_file = st.file_uploader(
         "Upload a document",
         type=["pdf", "txt", "md"],
@@ -150,12 +156,14 @@ def render_app() -> None:
     _render_ask_aion(
         result,
         pipeline=pipeline,
+        conversation_manager=conversation_manager,
         top_k=int(top_k),
         ollama_model=ollama_model,
         installed_ollama_models=installed_ollama_models,
         temperature=float(temperature),
         show_prompt_debug=show_prompt_debug,
     )
+    _render_conversation_memory_debug(conversation_manager)
 
 
 def _save_uploaded_file(filename: str, file_bytes: bytes) -> Path:
@@ -297,6 +305,7 @@ def _render_index_stats(result: ProcessingResult) -> None:
 def _render_ask_aion(
     result: ProcessingResult,
     pipeline: ProcessingPipeline,
+    conversation_manager: ConversationManager,
     top_k: int,
     ollama_model: str,
     installed_ollama_models: list[str],
@@ -354,12 +363,85 @@ def _render_ask_aion(
         st.error(f"RAG generation failed: {error}")
         return
 
+    conversation_manager.add_turn(user_message=query, assistant_message=generated_response.response)
+
     _render_generated_response(
         generated_response,
         prompt_builder=prompt_builder,
         show_prompt_debug=show_prompt_debug,
     )
     _render_retrieval_results(generated_response.retrieved_chunks)
+
+
+def _get_conversation_manager(session_id: str) -> ConversationManager:
+    """Return or initialize a conversation manager for the current session."""
+    manager = st.session_state.get("conversation_manager")
+    if manager is None or manager.session_id != session_id:
+        manager = ConversationManager(session_id=session_id)
+        manager.load()
+        st.session_state["conversation_manager"] = manager
+    return manager
+
+
+def _render_conversation_memory_debug(manager: ConversationManager) -> None:
+    """Display conversational memory diagnostics and controls."""
+    st.header("Conversation Memory Debug")
+
+    current_session_id = st.text_input(
+        "Session ID",
+        value=manager.session_id,
+        key="conversation_session_id",
+        help="Identifier used to persist conversation history on disk.",
+    )
+
+    if current_session_id != manager.session_id:
+        manager = ConversationManager(session_id=current_session_id)
+        manager.load()
+        st.session_state["conversation_manager"] = manager
+
+    session_file = manager.memory_store.memory_directory / f"{manager.session_id}.json"
+    memory_exists = session_file.exists()
+
+    session_info_col, turn_count_col = st.columns(2)
+    session_info_col.write("**Session Information**")
+    session_info_col.write(f"- Current session ID: `{manager.session_id}`")
+    turn_count_col.write("**Stored Turns**")
+    turn_count_col.write(f"- Number of stored turns: `{len(manager.turns)}`")
+
+    with st.expander("Recent Conversation Turns", expanded=True):
+        recent_turns = manager.get_recent_turns(limit=5)
+        if not recent_turns:
+            st.info("No conversation turns are currently stored for this session.")
+        else:
+            for index, turn in enumerate(recent_turns, start=1):
+                with st.expander(f"Turn {index} — {turn.timestamp}", expanded=False):
+                    st.write(f"**User:** {turn.user_message}")
+                    st.write(f"**Assistant:** {turn.assistant_message}")
+                    st.write(f"**Timestamp:** {turn.timestamp}")
+
+    control_col_1, control_col_2, control_col_3 = st.columns(3)
+    load_memory = control_col_1.button("Load Memory")
+    save_memory = control_col_2.button("Save Memory")
+    clear_memory = control_col_3.button("Clear Memory")
+
+    if load_memory:
+        manager.load()
+        st.session_state["conversation_manager"] = manager
+        st.success("Loaded memory from disk.")
+
+    if save_memory:
+        saved_path = manager.save()
+        st.session_state["conversation_manager"] = manager
+        st.success(f"Saved memory to disk at `{saved_path}`.")
+
+    if clear_memory:
+        manager.clear()
+        st.session_state["conversation_manager"] = manager
+        st.warning("Cleared in-memory conversation history. Use Save Memory to persist the cleared state.")
+
+    st.write("**Memory File Information**")
+    st.write(f"- Memory file path: `{session_file}`")
+    st.write(f"- Exists on disk: `{memory_exists}`")
 
 
 def _render_generated_response(
