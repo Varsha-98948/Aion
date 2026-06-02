@@ -9,12 +9,14 @@ reusable from scripts, tests, or future APIs.
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import streamlit as st
 
 from core.chunker import Chunker
 from core.conversation_manager import ConversationManager
 from core.embedder import EmbeddingEngine
+from core.knowledge_base import KnowledgeBaseManager
 from core.llm_client import OllamaClient
 from core.pipeline import ProcessingPipeline, ProcessingResult
 from core.prompt_builder import PromptBuilder
@@ -22,29 +24,124 @@ from core.rag_pipeline import RAGPipeline
 from core.retriever import Retriever
 from core.retrieval_models import RetrievalResult
 from core.response_models import GeneratedResponse
+from core.vector_store import VectorStore
 
 UPLOADS_DIRECTORY = Path("data/uploads")
 DEFAULT_OLLAMA_MODELS = ["gemma", "mistral", "llama3"]
+KNOWLEDGE_BASE_DIRECTORY = Path("data/knowledge_base")
+INDEXES_DIRECTORY = Path("data/indexes")
+
+
+def _find_latest_vector_index(kb_manager: KnowledgeBaseManager) -> tuple[str, Path] | None:
+    """Find the most recently added document's vector index.
+    
+    Returns:
+        Tuple of (document_id, index_directory) if found, None otherwise.
+    """
+    documents = kb_manager.list_documents()
+    if not documents:
+        return None
+    
+    # Most recently added document is at the end (sorted by date_added)
+    latest_doc = documents[-1]
+    index_dir = INDEXES_DIRECTORY / latest_doc.document_id
+    
+    if index_dir.exists():
+        return latest_doc.document_id, index_dir
+    
+    return None
+
+
+def _load_vector_store_from_index(index_directory: Path, embedding_engine: EmbeddingEngine) -> VectorStore | None:
+    """Load a vector store from a persisted FAISS index directory.
+    
+    Args:
+        index_directory: Path to directory containing index.faiss and index_metadata.json
+        embedding_engine: EmbeddingEngine for query embedding during retrieval
+    
+    Returns:
+        Loaded VectorStore if successful, None if loading fails.
+    """
+    try:
+        vector_store = VectorStore(index_directory=index_directory)
+        vector_store.load_index(index_directory=index_directory)
+        return vector_store
+    except (FileNotFoundError, json.JSONDecodeError, Exception) as e:
+        st.warning(f"Could not load vector index: {e}")
+        return None
+
+
+def _get_kb_index_stats(vector_store: VectorStore) -> dict:
+    """Extract index statistics from a loaded vector store."""
+    return {
+        "indexed_vectors": vector_store.record_count,
+        "embedding_dimension": vector_store.embedding_dimension,
+        "index_type": "IndexFlatIP",
+        "metric": "cosine_similarity_via_normalized_inner_product",
+        "index_directory": str(vector_store.index_directory),
+    }
+
+
+def _render_knowledge_base_sidebar(kb_manager: KnowledgeBaseManager) -> None:
+    """Display knowledge base statistics and management in sidebar."""
+
+    with st.sidebar:
+        st.divider()
+        st.header("📚 Knowledge Base")
+
+        stats = kb_manager.get_statistics()
+        
+        col1, col2 = st.columns(2)
+        col1.metric("Documents", stats.total_documents)
+        col2.metric("Total Chunks", stats.total_chunks)
+
+        if stats.total_documents > 0:
+            col3, col4 = st.columns(2)
+            col3.metric("Avg Chunks/Doc", f"{stats.average_chunks_per_document:.1f}")
+            col4.metric("Total Chunks", stats.total_chunks)
+
+            with st.expander("📖 Stored Documents", expanded=False):
+                documents = kb_manager.list_documents()
+                for idx, doc_meta in enumerate(documents, start=1):
+                    st.write(
+                        f"{idx}. **{doc_meta.filename}** "
+                        f"({doc_meta.file_type.upper()}) "
+                        f"| {doc_meta.chunk_count} chunks"
+                    )
+                    st.caption(f"Added: {doc_meta.date_added[:10]}")
+
+            with st.expander("⚙️ Knowledge Base Controls", expanded=False):
+                if st.button("Export Knowledge Base", use_container_width=True):
+                    try:
+                        export_path = kb_manager.export_knowledge_base(
+                            "data/knowledge_base/export_backup.json"
+                        )
+                        st.success(f"✓ Exported to {export_path}")
+                    except Exception as e:
+                        st.error(f"Export failed: {e}")
+
+                if st.button("Clear Knowledge Base", use_container_width=True):
+                    if st.checkbox("I understand this will delete all metadata", key="confirm_clear_kb"):
+                        kb_manager.clear_knowledge_base()
+                        st.success("✓ Knowledge Base cleared")
+                        st.rerun()
 
 
 def render_app() -> None:
-    """Render Aion's preprocessing and embedding dashboard."""
+    """Render Aion's preprocessing and embedding dashboard with KB-first initialization."""
 
     st.set_page_config(page_title="Aion", layout="wide")
     st.title("Aion")
     st.subheader("Local-First Semantic Memory Dashboard")
-    st.write(
-        "This dashboard shows Aion's semantic preprocessing layer: document "
-        "loading, chunk generation, embedding generation, and developer-focused "
-        "vector observability before retrieval and FAISS indexing."
-    )
 
+    # Initialize configuration
     default_chunker = Chunker()
     default_embedder = EmbeddingEngine()
     ollama_discovery_client = OllamaClient(model="gemma")
     installed_ollama_models = ollama_discovery_client.list_models()
     ollama_model_options = _build_ollama_model_options(installed_ollama_models)
 
+    # Configuration sidebar (unchanged)
     with st.sidebar:
         st.header("Chunker Config")
         chunk_size = st.number_input(
@@ -91,6 +188,7 @@ def render_app() -> None:
             step=1,
             help="Number of nearest chunks to return for semantic search.",
         )
+
         st.header("Generation Config")
         ollama_model = st.selectbox(
             "Ollama Model",
@@ -116,6 +214,7 @@ def render_app() -> None:
             help="Display the final grounded prompt sent to Ollama.",
         )
 
+    # Initialize pipeline and conversation manager
     pipeline = ProcessingPipeline(
         chunker=Chunker(chunk_size=int(chunk_size), overlap=int(overlap)),
         embedder=EmbeddingEngine(
@@ -130,39 +229,135 @@ def render_app() -> None:
 
     conversation_manager = _get_conversation_manager(st.session_state["conversation_session_id"])
 
+    # Initialize and load knowledge base
+    kb_manager = KnowledgeBaseManager(kb_directory=KNOWLEDGE_BASE_DIRECTORY)
+    _render_knowledge_base_sidebar(kb_manager)
+
+    # Try to load existing knowledge base index
+    kb_has_documents = kb_manager.get_document_count() > 0
+    loaded_vector_store = None
+    loaded_doc_id = None
+
+    if kb_has_documents:
+        index_info = _find_latest_vector_index(kb_manager)
+        if index_info:
+            loaded_doc_id, index_dir = index_info
+            loaded_vector_store = _load_vector_store_from_index(index_dir, pipeline.embedder)
+
+    # Show description
+    st.write(
+        "This dashboard shows Aion's semantic preprocessing layer: document "
+        "loading, chunk generation, embedding generation, and developer-focused "
+        "vector observability before retrieval and FAISS indexing."
+    )
+
+    # ========================================================================
+    # SECTION 1: Ask Aion from Knowledge Base (always visible if KB has content)
+    # ========================================================================
+    if loaded_vector_store is not None:
+        st.divider()
+        _render_ask_aion_from_kb(
+            vector_store=loaded_vector_store,
+            pipeline=pipeline,
+            conversation_manager=conversation_manager,
+            document_id=loaded_doc_id,
+            top_k=int(top_k),
+            ollama_model=ollama_model,
+            installed_ollama_models=installed_ollama_models,
+            temperature=float(temperature),
+            show_prompt_debug=show_prompt_debug,
+        )
+        st.divider()
+
+    # ========================================================================
+    # SECTION 2: Upload New Document
+    # ========================================================================
+    if kb_has_documents:
+        st.header("Add Document to Knowledge Base")
+        st.caption("Upload a new document to add to your knowledge base")
+    else:
+        st.header("Get Started - Upload Your First Document")
+        if not loaded_vector_store:
+            st.warning("📚 Your Knowledge Base is empty. Upload a document to get started.")
+
+    upload_mode = st.radio(
+        "Upload Mode",
+        options=["Temporary", "Add To Knowledge Base"],
+        help=(
+            "Temporary: Process and search only during this session. "
+            "Add To Knowledge Base: Process, register, and persist for future sessions."
+        ),
+    )
+
     uploaded_file = st.file_uploader(
         "Upload a document",
         type=["pdf", "txt", "md"],
         help="Supported formats match the current ingestion layer.",
     )
 
-    if uploaded_file is None:
-        st.info("Upload a PDF, TXT, or Markdown file to inspect chunks and embeddings.")
-        return
+    if uploaded_file is not None:
+        saved_file_path = _save_uploaded_file(uploaded_file.name, bytes(uploaded_file.getbuffer()))
 
-    saved_file_path = _save_uploaded_file(uploaded_file.name, bytes(uploaded_file.getbuffer()))
+        try:
+            result = pipeline.process_file(saved_file_path, filename=uploaded_file.name, save_output=True)
+        except Exception as error:
+            st.error(f"Pipeline execution failed: {error}")
+            return
 
-    try:
-        result = pipeline.process_file(saved_file_path, filename=uploaded_file.name, save_output=True)
-    except Exception as error:
-        st.error(f"Pipeline execution failed: {error}")
-        return
+        # Handle upload mode: register in knowledge base if needed
+        if upload_mode == "Add To Knowledge Base":
+            try:
+                kb_manager.register_document(
+                    document_id=result.document.doc_id,
+                    filename=result.document.filename,
+                    file_type=result.document.file_type,
+                    chunk_count=result.stats.chunk_count,
+                    custom_metadata={
+                        "source_path": str(saved_file_path),
+                        "embedding_model": result.embedding_stats.model_name,
+                        "chunk_config": {
+                            "chunk_size": result.stats.chunk_size,
+                            "overlap": result.stats.overlap,
+                        },
+                    },
+                )
+                st.success(f"✓ Document registered in Knowledge Base (ID: `{result.document.doc_id}`)")
+            except ValueError as error:
+                st.warning(f"Document already in Knowledge Base: {error}")
+        else:
+            st.info(f"ℹ️ Document processed in temporary mode (not persisted to Knowledge Base)")
 
-    _render_document_info(result)
-    _render_chunk_stats(result)
-    _render_embedded_chunk_previews(result)
-    _render_embedding_stats(result)
-    _render_index_stats(result)
-    _render_ask_aion(
-        result,
-        pipeline=pipeline,
-        conversation_manager=conversation_manager,
-        top_k=int(top_k),
-        ollama_model=ollama_model,
-        installed_ollama_models=installed_ollama_models,
-        temperature=float(temperature),
-        show_prompt_debug=show_prompt_debug,
-    )
+        # ====================================================================
+        # SECTION 3: Display newly uploaded document details and statistics
+        # ====================================================================
+        st.divider()
+        st.header("Uploaded Document Details")
+
+        _render_document_info(result)
+        _render_chunk_stats(result)
+        _render_embedded_chunk_previews(result)
+        _render_embedding_stats(result)
+        _render_index_stats(result)
+
+        # ====================================================================
+        # SECTION 4: Ask Aion about newly uploaded document
+        # ====================================================================
+        st.divider()
+        _render_ask_aion(
+            result,
+            pipeline=pipeline,
+            conversation_manager=conversation_manager,
+            top_k=int(top_k),
+            ollama_model=ollama_model,
+            installed_ollama_models=installed_ollama_models,
+            temperature=float(temperature),
+            show_prompt_debug=show_prompt_debug,
+        )
+
+    # ========================================================================
+    # SECTION 5: Conversation Memory (always visible)
+    # ========================================================================
+    st.divider()
     _render_conversation_memory_debug(conversation_manager)
 
 
@@ -300,6 +495,90 @@ def _render_index_stats(result: ProcessingResult) -> None:
         "FAISS searches nearest vectors. With normalized embeddings, inner "
         "product behaves like cosine similarity for semantic retrieval."
     )
+
+
+def _render_ask_aion_from_kb(
+    vector_store: VectorStore,
+    pipeline: ProcessingPipeline,
+    conversation_manager: ConversationManager,
+    document_id: str,
+    top_k: int,
+    ollama_model: str,
+    installed_ollama_models: list[str],
+    temperature: float,
+    show_prompt_debug: bool,
+) -> None:
+    """Render the RAG interaction for a document loaded from the knowledge base.
+    
+    This allows querying previously indexed KB documents without uploading a new file.
+    """
+
+    st.header("Ask Aion")
+    st.caption(f"Querying Knowledge Base (Document ID: `{document_id[:8]}...`)")
+    st.caption("USER QUERY -> SEMANTIC RETRIEVAL -> CONTEXT INJECTION -> OLLAMA RESPONSE GENERATION")
+
+    query = st.text_area(
+        "User Query",
+        placeholder=(
+            "What does this document say about semantic search?\n"
+            "Summarize the key concepts"
+        ),
+        height=120,
+        key="kb_query",
+    )
+    generate_response = st.button("Generate Response", type="primary", key="kb_generate")
+
+    if not generate_response:
+        return
+
+    if not query.strip():
+        st.warning("Enter a query before generating a response.")
+        return
+
+    if vector_store.record_count == 0:
+        st.warning("No vectors available in the knowledge base index.")
+        return
+
+    if not _is_ollama_model_installed(ollama_model, installed_ollama_models):
+        st.error(
+            "Selected Ollama model is not installed locally.\n\n"
+            f"Run:\nollama pull {ollama_model}"
+        )
+        return
+
+    retriever = Retriever(
+        vector_store=vector_store,
+        embedding_engine=pipeline.embedder,
+        top_k=top_k,
+    )
+
+    try:
+        prompt_builder = PromptBuilder()
+        rag_pipeline = RAGPipeline(
+            retriever=retriever,
+            prompt_builder=prompt_builder,
+            llm_client=OllamaClient(model=ollama_model, temperature=temperature),
+            conversation_manager=conversation_manager,
+            top_k=top_k,
+            memory_window=5,
+        )
+        generated_response = rag_pipeline.ask(query, top_k=top_k)
+    except Exception as error:
+        st.error(f"RAG generation failed: {error}")
+        return
+
+    st.subheader("Response Metrics")
+    metric_col_1, metric_col_2, metric_col_3 = st.columns(3)
+    metric_col_1.metric("Memory Turns Used", generated_response.metadata.get("memory_turn_count", 0))
+    metric_col_2.metric("Retrieved Chunks", generated_response.metadata.get("retrieved_chunk_count", 0))
+    metric_col_3.metric("Vector Index Size", vector_store.record_count)
+
+    _render_generated_response(
+        generated_response,
+        prompt_builder=prompt_builder,
+        show_prompt_debug=show_prompt_debug,
+    )
+    _render_retrieval_results(generated_response.retrieved_chunks)
 
 
 def _render_ask_aion(

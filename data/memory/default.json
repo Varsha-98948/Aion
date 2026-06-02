@@ -22,5 +22,11 @@
     "timestamp": "2026-06-01T08:06:05Z",
     "turn_id": "fbb7aa03166c46b49ac74d16282217bf",
     "user_message": "What problem was it designed to solve?"
+  },
+  {
+    "assistant_message": "Sure, here is the answer to the question:\n\n6LoWPAN is a wireless technology that allows small IoT devices to communicate with the internet using IPv6 efficiently. It uses header compression to reduce packet size, and it supports fragmentation of large IPv6 packets.",
+    "timestamp": "2026-06-02T17:56:13Z",
+    "turn_id": "d656445ee37e445fa6be66bbfdc5a951",
+    "user_message": "What is 6lowpan?"
   }
 ]
