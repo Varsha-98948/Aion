@@ -32,8 +32,39 @@ KNOWLEDGE_BASE_DIRECTORY = Path("data/knowledge_base")
 INDEXES_DIRECTORY = Path("data/indexes")
 
 
+def _find_vector_index_directory(document_id: str) -> Path | None:
+    """Find a persisted FAISS index directory for a given document ID.
+
+    This is robust against folder naming conventions used during index creation.
+    It scans all known index directories and checks their metadata for a matching
+    document_id.
+    """
+    for candidate_dir in INDEXES_DIRECTORY.iterdir():
+        if not candidate_dir.is_dir():
+            continue
+
+        metadata_path = candidate_dir / VectorStore.METADATA_FILENAME
+        if not metadata_path.exists():
+            continue
+
+        try:
+            with metadata_path.open("r", encoding="utf-8") as file:
+                payload = json.load(file)
+        except json.JSONDecodeError:
+            continue
+
+        for record in payload.get("records", []):
+            if record.get("document_id") == document_id:
+                return candidate_dir
+
+        if candidate_dir.name.endswith(document_id[:12]):
+            return candidate_dir
+
+    return None
+
+
 def _find_latest_vector_index(kb_manager: KnowledgeBaseManager) -> tuple[str, Path] | None:
-    """Find the most recently added document's vector index.
+    """Find the most recently added document's persisted vector index.
     
     Returns:
         Tuple of (document_id, index_directory) if found, None otherwise.
@@ -41,14 +72,12 @@ def _find_latest_vector_index(kb_manager: KnowledgeBaseManager) -> tuple[str, Pa
     documents = kb_manager.list_documents()
     if not documents:
         return None
-    
-    # Most recently added document is at the end (sorted by date_added)
-    latest_doc = documents[-1]
-    index_dir = INDEXES_DIRECTORY / latest_doc.document_id
-    
-    if index_dir.exists():
-        return latest_doc.document_id, index_dir
-    
+
+    for document in reversed(documents):
+        index_dir = _find_vector_index_directory(document.document_id)
+        if index_dir is not None:
+            return document.document_id, index_dir
+
     return None
 
 
@@ -250,6 +279,11 @@ def render_app() -> None:
         "loading, chunk generation, embedding generation, and developer-focused "
         "vector observability before retrieval and FAISS indexing."
     )
+
+    if loaded_vector_store is not None:
+        st.success("Knowledge Base Ready")
+    else:
+        st.info("No indexed knowledge available yet.")
 
     # ========================================================================
     # SECTION 1: Ask Aion from Knowledge Base (always visible if KB has content)
