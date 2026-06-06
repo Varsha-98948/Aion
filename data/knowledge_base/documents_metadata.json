@@ -1,14 +1,14 @@
 {
   "version": "1.0",
-  "last_updated": "2026-06-02T17:58:32.113776+00:00",
+  "last_updated": "2026-06-05T18:11:57.154631+00:00",
   "document_count": 1,
   "documents": [
     {
-      "kb_doc_id": "b209e4cb-0a8b-4c17-b14f-619066b6d388",
+      "kb_doc_id": "5df8bad2-96f7-46d4-8805-22b4fb807cd7",
       "document_id": "0a42e426bf7f6da9a4d17eaa92750361717af320",
       "filename": "Sample.pdf",
       "file_type": "pdf",
-      "date_added": "2026-06-02T17:58:32.113776+00:00",
+      "date_added": "2026-06-05T18:11:57.154631+00:00",
       "chunk_count": 51,
       "metadata": {
         "source_path": "data\\uploads\\Sample.pdf",

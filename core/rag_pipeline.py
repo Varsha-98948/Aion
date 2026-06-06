@@ -7,9 +7,15 @@ lets Aion improve retrieval, prompting, and LLM transport independently.
 Memory-aware RAG extends this by also retrieving recent conversation history
 and injecting it into the prompt. The conversation layer stays independent from
 document retrieval, ensuring memory is never embedded into vector search.
+
+Citations connect generated answers back to source chunks, making RAG responses
+traceable and verifiable. Each answer includes citations pointing to the specific
+chunks that informed the response.
 """
 
 from __future__ import annotations
+
+from collections import defaultdict
 
 from .conversation_manager import ConversationManager
 from .llm_client import OllamaClient
@@ -17,7 +23,7 @@ from .memory_models import ConversationTurn
 from .prompt_builder import PromptBuilder
 from .response_models import GeneratedResponse
 from .retriever import Retriever
-from .retrieval_models import RetrievalResult
+from .retrieval_models import RetrievalResult, Citation, SourceDocument
 
 
 class RAGPipeline:
@@ -63,7 +69,9 @@ class RAGPipeline:
         2. Retrieve relevant document chunks
         3. Build prompt with memory history + retrieved context + query
         4. Generate response using LLM
-        5. Save turn to memory (if memory manager is available)
+        5. Extract citations from retrieved chunks
+        6. Aggregate source documents from citations
+        7. Save turn to memory (if memory manager is available)
         """
 
         cleaned_query = query.strip()
@@ -72,6 +80,8 @@ class RAGPipeline:
                 query=query,
                 response="Please enter a question.",
                 retrieved_chunks=[],
+                citations=[],
+                source_documents=[],
                 metadata={"error": "empty_query"},
             )
 
@@ -92,13 +102,22 @@ class RAGPipeline:
             )
             self.conversation_manager.save()
 
+        # Extract citations from retrieved chunks
+        citations = self._extract_citations(retrieved_chunks)
+        # Aggregate source documents
+        source_documents = self._aggregate_source_documents(citations)
+
         return GeneratedResponse(
             query=cleaned_query,
             response=response,
             retrieved_chunks=retrieved_chunks,
+            citations=citations,
+            source_documents=source_documents,
             metadata={
                 "top_k": top_k or self.top_k,
                 "retrieved_chunk_count": len(retrieved_chunks),
+                "citation_count": len(citations),
+                "source_document_count": len(source_documents),
                 "memory_turn_count": len(memory_turns),
                 "llm_model": self.llm_client.config.model,
                 "prompt": prompt,
@@ -128,6 +147,66 @@ class RAGPipeline:
         """Generate an answer from a grounded prompt using the LLM client."""
 
         return self.llm_client.generate(prompt=prompt, system_prompt=system_prompt)
+
+    def _extract_citations(self, retrieved_chunks: list[RetrievalResult]) -> list[Citation]:
+        """Extract citation metadata from retrieved chunks.
+
+        Each retrieved chunk becomes a citation, capturing the exact provenance
+        of where retrieved information came from. Citations are ordered by
+        similarity score (highest first) to prioritize the most relevant sources.
+        """
+
+        citations: list[Citation] = []
+        for chunk in retrieved_chunks:
+            citation = Citation(
+                source_filename=chunk.source_filename,
+                document_id=chunk.document_id,
+                chunk_index=chunk.chunk_index,
+                similarity_score=chunk.similarity_score,
+                chunk_text=chunk.text,
+            )
+            citations.append(citation)
+
+        return citations
+
+    def _aggregate_source_documents(self, citations: list[Citation]) -> list[SourceDocument]:
+        """Aggregate citations by document, creating document-level source metadata.
+
+        When multiple chunks from the same document are cited, this method
+        groups them and computes aggregate statistics (average similarity score,
+        chunk count) for cleaner answer-level source information.
+        """
+
+        if not citations:
+            return []
+
+        # Group citations by document_id
+        documents_map: dict[str, list[Citation]] = defaultdict(list)
+        for citation in citations:
+            documents_map[citation.document_id].append(citation)
+
+        # Aggregate to SourceDocument records
+        source_documents: list[SourceDocument] = []
+        for document_id, doc_citations in documents_map.items():
+            if not doc_citations:
+                continue
+
+            source_filename = doc_citations[0].source_filename
+            chunk_count = len(doc_citations)
+            avg_similarity = sum(c.similarity_score for c in doc_citations) / chunk_count
+
+            source_doc = SourceDocument(
+                document_id=document_id,
+                source_filename=source_filename,
+                chunk_count_referenced=chunk_count,
+                avg_similarity_score=avg_similarity,
+            )
+            source_documents.append(source_doc)
+
+        # Sort by average similarity (highest first)
+        source_documents.sort(key=lambda s: s.avg_similarity_score, reverse=True)
+
+        return source_documents
 
 
 __all__ = ["RAGPipeline"]
