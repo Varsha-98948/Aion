@@ -14,11 +14,59 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.chunk_models import Chunk
 from core.retrieval_models import RetrievalResult, Citation, SourceDocument
 from core.response_models import GeneratedResponse
+from core.embedding_models import EmbeddedChunk
 from core.embedder import EmbeddingEngine
 from core.vector_store import VectorStore
 from core.retriever import Retriever
 from core.rag_pipeline import RAGPipeline
 from core.prompt_builder import PromptBuilder
+from core.knowledge_base import KnowledgeBaseManager
+from ui import app_streamlit
+
+
+class FakeEmbeddingEngine:
+    """Small deterministic query embedder for retrieval tests."""
+
+    def embed_texts(self, texts, batch_size=None):
+        return [[1.0, 0.0] for text in texts if text.strip()]
+
+
+class FakeLLMClient:
+    """Small deterministic LLM client for end-to-end RAG tests."""
+
+    def __init__(self):
+        self.config = type("Config", (), {"model": "fake-llm"})()
+
+    def generate(self, prompt: str, system_prompt: str) -> str:
+        return "IoT connects devices, while cloud computing provides remote computing resources."
+
+
+def _embedded_chunk(
+    chunk_id: str,
+    document_id: str,
+    filename: str,
+    chunk_index: int,
+    text: str,
+    embedding: list[float],
+) -> EmbeddedChunk:
+    return EmbeddedChunk(
+        chunk_id=chunk_id,
+        document_id=document_id,
+        text=text,
+        embedding=embedding,
+        metadata={
+            "source_filename": filename,
+            "source_file_type": "pdf",
+            "chunk_index": chunk_index,
+        },
+    )
+
+
+def _build_persisted_store(index_directory: Path, chunks: list[EmbeddedChunk]) -> VectorStore:
+    store = VectorStore(index_directory=index_directory)
+    store.build_index(chunks)
+    store.save_index(index_directory)
+    return store
 
 
 class TestCitationMetadata:
@@ -324,6 +372,157 @@ class TestMetadataFlow:
         # Verify all metadata is preserved
         for key, value in metadata.items():
             assert result.metadata[key] == value
+
+
+class TestUnifiedKnowledgeBaseRetrieval:
+    """Test cross-document retrieval through a unified knowledge-base vector store."""
+
+    def test_retrieval_across_multiple_documents(self, tmp_path):
+        """Test that one retriever can return chunks from multiple documents."""
+
+        iot_chunk = _embedded_chunk(
+            "iot_chunk_1",
+            "doc_iot",
+            "Sample_1.pdf",
+            0,
+            "IoT means Internet of Things, where connected devices exchange data.",
+            [1.0, 0.0],
+        )
+        cloud_chunk = _embedded_chunk(
+            "cloud_chunk_1",
+            "doc_cloud",
+            "Sample_2.pdf",
+            0,
+            "Cloud computing provides on-demand servers, storage, and applications.",
+            [1.0, 0.0],
+        )
+
+        iot_store = _build_persisted_store(tmp_path / "iot_index", [iot_chunk])
+        cloud_store = _build_persisted_store(tmp_path / "cloud_index", [cloud_chunk])
+
+        unified_store = VectorStore(index_directory=tmp_path / "unified")
+        unified_store.merge_from_store(iot_store)
+        unified_store.merge_from_store(cloud_store)
+
+        retriever = Retriever(
+            vector_store=unified_store,
+            embedding_engine=FakeEmbeddingEngine(),
+            top_k=2,
+        )
+        results = retriever.retrieve("What do you mean by IoT and Cloud Computing?", top_k=2)
+
+        assert len(results) == 2
+        assert {result.document_id for result in results} == {"doc_iot", "doc_cloud"}
+        assert {result.source_filename for result in results} == {"Sample_1.pdf", "Sample_2.pdf"}
+        assert all(result.chunk_index == 0 for result in results)
+
+    def test_unified_kb_retrieval_works_after_restart(self, tmp_path, monkeypatch):
+        """Test that persisted per-document indexes reload into one KB store."""
+
+        indexes_directory = tmp_path / "indexes"
+        monkeypatch.setattr(app_streamlit, "INDEXES_DIRECTORY", indexes_directory)
+
+        iot_chunk = _embedded_chunk(
+            "iot_chunk_1",
+            "doc_iot",
+            "Sample_1.pdf",
+            0,
+            "IoT connects physical devices and sensors to networks.",
+            [1.0, 0.0],
+        )
+        cloud_chunk = _embedded_chunk(
+            "cloud_chunk_1",
+            "doc_cloud",
+            "Sample_2.pdf",
+            0,
+            "Cloud computing offers remote infrastructure and software services.",
+            [1.0, 0.0],
+        )
+
+        _build_persisted_store(indexes_directory / "sample_1_doc_iot", [iot_chunk])
+        _build_persisted_store(indexes_directory / "sample_2_doc_cloud", [cloud_chunk])
+
+        kb_manager = KnowledgeBaseManager(kb_directory=tmp_path / "knowledge_base")
+        kb_manager.register_document("doc_iot", "Sample_1.pdf", "pdf", 1)
+        kb_manager.register_document("doc_cloud", "Sample_2.pdf", "pdf", 1)
+
+        unified_index_info = app_streamlit._load_unified_kb_vector_store(
+            kb_manager,
+            FakeEmbeddingEngine(),
+        )
+
+        assert unified_index_info is not None
+        unified_store, loaded_document_ids = unified_index_info
+        assert unified_store.record_count == 2
+        assert set(loaded_document_ids) == {"doc_iot", "doc_cloud"}
+
+        retriever = Retriever(
+            vector_store=unified_store,
+            embedding_engine=FakeEmbeddingEngine(),
+            top_k=2,
+        )
+        results = retriever.retrieve("What do you mean by IoT and Cloud Computing?", top_k=2)
+
+        assert len(results) == 2
+        assert {result.document_id for result in results} == {"doc_iot", "doc_cloud"}
+        assert {result.metadata["source_filename"] for result in results} == {
+            "Sample_1.pdf",
+            "Sample_2.pdf",
+        }
+
+    def test_citations_survive_end_to_end_generation(self, tmp_path):
+        """Test that RAG output includes citations and source summaries."""
+
+        chunks = [
+            _embedded_chunk(
+                "iot_chunk_1",
+                "doc_iot",
+                "Sample_1.pdf",
+                0,
+                "IoT means Internet of Things and connected devices.",
+                [1.0, 0.0],
+            ),
+            _embedded_chunk(
+                "cloud_chunk_1",
+                "doc_cloud",
+                "Sample_2.pdf",
+                0,
+                "Cloud computing means remote computing resources over a network.",
+                [1.0, 0.0],
+            ),
+        ]
+        vector_store = _build_persisted_store(tmp_path / "unified_index", chunks)
+        retriever = Retriever(
+            vector_store=vector_store,
+            embedding_engine=FakeEmbeddingEngine(),
+            top_k=2,
+        )
+        rag_pipeline = RAGPipeline(
+            retriever=retriever,
+            prompt_builder=PromptBuilder(),
+            llm_client=FakeLLMClient(),
+            top_k=2,
+        )
+
+        generated_response = rag_pipeline.ask(
+            "What do you mean by IoT and Cloud Computing?",
+            top_k=2,
+        )
+
+        assert generated_response.response
+        assert len(generated_response.retrieved_chunks) == 2
+        assert len(generated_response.citations) == 2
+        assert len(generated_response.source_documents) == 2
+        assert {citation.source_filename for citation in generated_response.citations} == {
+            "Sample_1.pdf",
+            "Sample_2.pdf",
+        }
+        assert {
+            source_document.chunk_count_referenced
+            for source_document in generated_response.source_documents
+        } == {1}
+        assert generated_response.metadata["citation_count"] == 2
+        assert generated_response.metadata["source_document_count"] == 2
 
 
 def run_tests():

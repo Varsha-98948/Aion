@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 import json
+import shutil
 from typing import Any
 from uuid import uuid4
 
@@ -85,6 +86,10 @@ class KnowledgeBaseStats:
     average_chunks_per_document: float = 0.0
     oldest_document_date: str = ""
     newest_document_date: str = ""
+
+
+class KnowledgeBaseClearError(RuntimeError):
+    """Raised when the knowledge base cannot be cleared safely."""
 
 
 class KnowledgeBaseManager:
@@ -287,6 +292,83 @@ class KnowledgeBaseManager:
         with self.metadata_file.open("w", encoding="utf-8") as file:
             json.dump(payload, file, indent=2, ensure_ascii=False, default=str)
 
+    def clear_knowledge_base(self, indexes_directory: str | Path | None = None) -> None:
+        """Remove all knowledge-base metadata and optional persisted indexes.
+
+        WARNING: This operation is irreversible. Use with caution.
+
+        The clear is staged so failures do not leave metadata deleted while
+        indexes remain, or indexes removed while metadata still advertises them.
+        """
+
+        previous_documents = dict(self._documents)
+        staging_directory = self.kb_directory / f".clear_staging_{uuid4().hex}"
+        moved_paths: list[tuple[Path, Path]] = []
+
+        try:
+            staging_directory.mkdir(parents=True, exist_ok=False)
+
+            if indexes_directory is not None:
+                indexes_path = Path(indexes_directory)
+                if indexes_path.exists():
+                    moved_paths.extend(
+                        self._move_directory_children(
+                            source_directory=indexes_path,
+                            staging_directory=staging_directory / "indexes",
+                        )
+                    )
+
+            if self.metadata_file.exists():
+                metadata_staging_directory = staging_directory / "knowledge_base"
+                metadata_staging_directory.mkdir(parents=True, exist_ok=True)
+                metadata_staging_path = metadata_staging_directory / self.METADATA_FILENAME
+                shutil.move(str(self.metadata_file), str(metadata_staging_path))
+                moved_paths.append((metadata_staging_path, self.metadata_file))
+
+            self._documents.clear()
+            shutil.rmtree(staging_directory)
+        except Exception as error:
+            self._restore_moved_paths(moved_paths)
+            self._documents = previous_documents
+
+            if staging_directory.exists():
+                shutil.rmtree(staging_directory, ignore_errors=True)
+
+            raise KnowledgeBaseClearError(
+                f"Knowledge Base clear failed; existing metadata and indexes were preserved. {error}"
+            ) from error
+
+    @staticmethod
+    def _move_directory_children(
+        source_directory: Path,
+        staging_directory: Path,
+    ) -> list[tuple[Path, Path]]:
+        """Move every child in a directory to staging and return restore paths."""
+
+        moved_paths: list[tuple[Path, Path]] = []
+        staging_directory.mkdir(parents=True, exist_ok=True)
+
+        for source_path in source_directory.iterdir():
+            staged_path = staging_directory / source_path.name
+            shutil.move(str(source_path), str(staged_path))
+            moved_paths.append((staged_path, source_path))
+
+        return moved_paths
+
+    @staticmethod
+    def _restore_moved_paths(moved_paths: list[tuple[Path, Path]]) -> None:
+        """Move staged files back to their original locations after a failure."""
+
+        for staged_path, original_path in reversed(moved_paths):
+            if not staged_path.exists():
+                continue
+
+            original_path.parent.mkdir(parents=True, exist_ok=True)
+            if original_path.exists():
+                continue
+
+            shutil.move(str(staged_path), str(original_path))
+
     def _load_metadata(self) -> None:
         """Load metadata from JSON file if it exists."""
         if not self.metadata_file.exists():
@@ -369,4 +451,9 @@ class KnowledgeBaseManager:
             raise ValueError(f"Invalid knowledge base import file: {error}")
 
 
-__all__ = ["KnowledgeBaseManager", "DocumentMetadata", "KnowledgeBaseStats"]
+__all__ = [
+    "KnowledgeBaseManager",
+    "DocumentMetadata",
+    "KnowledgeBaseClearError",
+    "KnowledgeBaseStats",
+]

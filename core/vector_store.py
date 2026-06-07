@@ -98,6 +98,37 @@ class VectorStore:
         self.index.add(embedding_matrix)
         self.records.extend(self._build_records(ordered_chunks))
 
+    def merge_from_store(self, other_store: "VectorStore") -> None:
+        """Merge another loaded vector store into this store.
+
+        This is used for knowledge-base retrieval, where each document may have
+        its own persisted FAISS index but queries need one unified search space.
+        """
+
+        if other_store.index is None or not other_store.records:
+            return
+
+        vectors = other_store._reconstruct_index_vectors()
+        if self.index is None:
+            self.embedding_dimension = vectors.shape[1]
+            self.index = faiss.IndexFlatIP(self.embedding_dimension)
+        elif vectors.shape[1] != self.embedding_dimension:
+            raise ValueError(
+                f"Index dimension mismatch. Expected {self.embedding_dimension}, "
+                f"received {vectors.shape[1]}."
+            )
+
+        self.index.add(self._normalize_matrix(vectors))
+        self.records.extend(
+            VectorRecord(
+                chunk_id=record.chunk_id,
+                document_id=record.document_id,
+                text=record.text,
+                metadata=dict(record.metadata),
+            )
+            for record in other_store.records
+        )
+
     def save_index(self, index_directory: str | Path | None = None) -> tuple[Path, Path]:
         """Persist the FAISS index plus row-aligned metadata files."""
 
@@ -216,6 +247,27 @@ class VectorStore:
         normalized_matrix = np.ascontiguousarray(matrix.astype(np.float32))
         faiss.normalize_L2(normalized_matrix)
         return normalized_matrix
+
+    def _reconstruct_index_vectors(self) -> np.ndarray:
+        """Return all stored FAISS vectors in record-aligned order."""
+
+        if self.index is None:
+            raise ValueError("Vector index has not been built or loaded.")
+
+        index_total = int(self.index.ntotal)
+        if index_total != len(self.records):
+            raise ValueError(
+                f"FAISS row count ({index_total}) does not match metadata records "
+                f"({len(self.records)})."
+            )
+        if index_total == 0:
+            raise ValueError("Cannot reconstruct vectors from an empty index.")
+
+        vectors = [
+            np.asarray(self.index.reconstruct(position), dtype=np.float32)
+            for position in range(index_total)
+        ]
+        return np.ascontiguousarray(vectors, dtype=np.float32)
 
     @staticmethod
     def _build_records(embedded_chunks: list[EmbeddedChunk]) -> list[VectorRecord]:

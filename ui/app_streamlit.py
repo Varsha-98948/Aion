@@ -16,7 +16,7 @@ import streamlit as st
 from core.chunker import Chunker
 from core.conversation_manager import ConversationManager
 from core.embedder import EmbeddingEngine
-from core.knowledge_base import KnowledgeBaseManager
+from core.knowledge_base import KnowledgeBaseClearError, KnowledgeBaseManager
 from core.llm_client import OllamaClient
 from core.pipeline import ProcessingPipeline, ProcessingResult
 from core.prompt_builder import PromptBuilder
@@ -39,6 +39,9 @@ def _find_vector_index_directory(document_id: str) -> Path | None:
     It scans all known index directories and checks their metadata for a matching
     document_id.
     """
+    if not INDEXES_DIRECTORY.exists():
+        return None
+
     for candidate_dir in INDEXES_DIRECTORY.iterdir():
         if not candidate_dir.is_dir():
             continue
@@ -81,6 +84,18 @@ def _find_latest_vector_index(kb_manager: KnowledgeBaseManager) -> tuple[str, Pa
     return None
 
 
+def _find_registered_vector_indexes(kb_manager: KnowledgeBaseManager) -> list[tuple[str, Path]]:
+    """Find persisted vector indexes for all registered knowledge-base documents."""
+
+    index_entries: list[tuple[str, Path]] = []
+    for document in kb_manager.list_documents():
+        index_dir = _find_vector_index_directory(document.document_id)
+        if index_dir is not None:
+            index_entries.append((document.document_id, index_dir))
+
+    return index_entries
+
+
 def _load_vector_store_from_index(index_directory: Path, embedding_engine: EmbeddingEngine) -> VectorStore | None:
     """Load a vector store from a persisted FAISS index directory.
     
@@ -98,6 +113,38 @@ def _load_vector_store_from_index(index_directory: Path, embedding_engine: Embed
     except (FileNotFoundError, json.JSONDecodeError, Exception) as e:
         st.warning(f"Could not load vector index: {e}")
         return None
+
+
+def _load_unified_kb_vector_store(
+    kb_manager: KnowledgeBaseManager,
+    embedding_engine: EmbeddingEngine,
+) -> tuple[VectorStore, list[str]] | None:
+    """Load and merge all registered knowledge-base indexes into one search store."""
+
+    index_entries = _find_registered_vector_indexes(kb_manager)
+    if not index_entries:
+        return None
+
+    unified_store = VectorStore(index_directory=INDEXES_DIRECTORY)
+    loaded_document_ids: list[str] = []
+
+    for document_id, index_dir in index_entries:
+        document_store = _load_vector_store_from_index(index_dir, embedding_engine)
+        if document_store is None:
+            continue
+
+        try:
+            unified_store.merge_from_store(document_store)
+        except ValueError as error:
+            st.warning(f"Could not merge vector index for document `{document_id}`: {error}")
+            continue
+
+        loaded_document_ids.append(document_id)
+
+    if unified_store.record_count == 0:
+        return None
+
+    return unified_store, loaded_document_ids
 
 
 def _get_kb_index_stats(vector_store: VectorStore) -> dict:
@@ -265,13 +312,12 @@ def render_app() -> None:
     # Try to load existing knowledge base index
     kb_has_documents = kb_manager.get_document_count() > 0
     loaded_vector_store = None
-    loaded_doc_id = None
+    loaded_document_ids: list[str] = []
 
     if kb_has_documents:
-        index_info = _find_latest_vector_index(kb_manager)
-        if index_info:
-            loaded_doc_id, index_dir = index_info
-            loaded_vector_store = _load_vector_store_from_index(index_dir, pipeline.embedder)
+        unified_index_info = _load_unified_kb_vector_store(kb_manager, pipeline.embedder)
+        if unified_index_info:
+            loaded_vector_store, loaded_document_ids = unified_index_info
 
     # Show description
     st.write(
@@ -281,7 +327,11 @@ def render_app() -> None:
     )
 
     if loaded_vector_store is not None:
-        st.success("Knowledge Base Ready")
+        st.success(
+            "Knowledge Base Ready: "
+            f"{loaded_vector_store.record_count} chunks across "
+            f"{len(loaded_document_ids)} indexed documents"
+        )
     else:
         st.info("No indexed knowledge available yet.")
 
@@ -294,7 +344,7 @@ def render_app() -> None:
             vector_store=loaded_vector_store,
             pipeline=pipeline,
             conversation_manager=conversation_manager,
-            document_id=loaded_doc_id,
+            document_ids=loaded_document_ids,
             top_k=int(top_k),
             ollama_model=ollama_model,
             installed_ollama_models=installed_ollama_models,
@@ -535,7 +585,7 @@ def _render_ask_aion_from_kb(
     vector_store: VectorStore,
     pipeline: ProcessingPipeline,
     conversation_manager: ConversationManager,
-    document_id: str,
+    document_ids: list[str],
     top_k: int,
     ollama_model: str,
     installed_ollama_models: list[str],
@@ -548,7 +598,10 @@ def _render_ask_aion_from_kb(
     """
 
     st.header("Ask Aion")
-    st.caption(f"Querying Knowledge Base (Document ID: `{document_id[:8]}...`)")
+    st.caption(
+        "Querying entire Knowledge Base "
+        f"({len(document_ids)} indexed documents, {vector_store.record_count} chunks)"
+    )
     st.caption("USER QUERY -> SEMANTIC RETRIEVAL -> CONTEXT INJECTION -> OLLAMA RESPONSE GENERATION")
 
     query = st.text_area(
@@ -776,6 +829,9 @@ def _render_generated_response(
         f"Retrieved chunks: `{generated_response.metadata.get('retrieved_chunk_count')}`"
     )
 
+    _render_citations(generated_response)
+    _render_source_documents(generated_response)
+
     if show_prompt_debug:
         injected_context = prompt_builder.format_context(generated_response.retrieved_chunks)
         with st.expander("Prompt Debug", expanded=False):
@@ -787,22 +843,77 @@ def _render_generated_response(
             st.code(str(generated_response.metadata.get("prompt", "")), language="text")
 
 
-def _render_retrieval_results(results: list[RetrievalResult]) -> None:
-    """Display ranked retrieval results with similarity scores."""
+def _render_citations(generated_response: GeneratedResponse) -> None:
+    """Display chunk-level citations used by the generated response."""
 
-    st.subheader("Retrieved Chunks")
+    st.subheader("Sources Used")
+
+    if not generated_response.citations:
+        st.info("No citations were produced for this response.")
+        return
+
+    for citation_index, citation in enumerate(generated_response.citations, start=1):
+        preview = citation.chunk_text.strip() or "No chunk preview available."
+        title = (
+            f"{citation_index}. {citation.source_filename} | "
+            f"chunk {citation.chunk_index} | score {citation.similarity_score:.4f}"
+        )
+        with st.expander(title, expanded=citation_index == 1):
+            filename_col, chunk_col, score_col = st.columns(3)
+            filename_col.write(f"**Filename:** `{citation.source_filename}`")
+            chunk_col.write(f"**Chunk Index:** `{citation.chunk_index}`")
+            score_col.write(f"**Similarity Score:** `{citation.similarity_score:.4f}`")
+            st.write("**Chunk Preview:**")
+            st.write(preview)
+
+
+def _render_source_documents(generated_response: GeneratedResponse) -> None:
+    """Display document-level source aggregation for a generated response."""
+
+    st.subheader("Source Documents")
+
+    if not generated_response.source_documents:
+        st.info("No source document summaries were produced for this response.")
+        return
+
+    st.table(
+        [
+            {
+                "filename": source_document.source_filename,
+                "chunks_used": source_document.chunk_count_referenced,
+                "average_similarity_score": f"{source_document.avg_similarity_score:.4f}",
+            }
+            for source_document in generated_response.source_documents
+        ]
+    )
+
+
+def _render_retrieval_results(results: list[RetrievalResult]) -> None:
+    """Display a developer-facing retrieval trace with full provenance."""
+
+    st.subheader("Retrieval Inspector")
 
     if not results:
         st.warning("No matching chunks were retrieved.")
         return
 
     for rank, result in enumerate(results, start=1):
-        title = f"Rank {rank} | Similarity Score {result.similarity_score:.4f}"
+        title = (
+            f"Rank {rank} | {result.source_filename} | "
+            f"chunk {result.chunk_index} | score {result.similarity_score:.4f}"
+        )
         with st.expander(title, expanded=rank == 1):
-            st.write(f"**Similarity Score:** `{result.similarity_score:.4f}`")
+            rank_col, filename_col, chunk_col, score_col = st.columns(4)
+            rank_col.write(f"**Rank:** `{rank}`")
+            filename_col.write(f"**Source Filename:** `{result.source_filename}`")
+            chunk_col.write(f"**Chunk Index:** `{result.chunk_index}`")
+            score_col.write(f"**Similarity Score:** `{result.similarity_score:.4f}`")
+
+            st.write(f"**Document ID:** `{result.document_id}`")
             st.progress(max(0.0, min(1.0, result.similarity_score)))
+            st.write("**Chunk Preview:**")
             st.write(result.text)
-            st.write("**Source Metadata:**")
+            st.write("**Raw Metadata:**")
             st.json(result.metadata)
 
 
