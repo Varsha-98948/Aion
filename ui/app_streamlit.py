@@ -12,6 +12,11 @@ from pathlib import Path
 import json
 
 import streamlit as st
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.chunker import Chunker
 from core.conversation_manager import ConversationManager
@@ -205,7 +210,6 @@ def _render_knowledge_base_sidebar(kb_manager: KnowledgeBaseManager) -> None:
 
 def render_app() -> None:
     """Render Aion's preprocessing and embedding dashboard with KB-first initialization."""
-
     st.set_page_config(page_title="Aion", layout="wide")
     st.title("Aion")
     st.subheader("Local-First Semantic Memory Dashboard")
@@ -953,3 +957,7 @@ def main() -> None:
     """Streamlit entry point."""
 
     render_app()
+
+
+if __name__ == "__main__":
+    main()
